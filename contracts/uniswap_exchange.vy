@@ -10,6 +10,9 @@ contract Exchange():
     def ethToTokenTransferInput(min_tokens: uint256, deadline: timestamp, recipient: address) -> uint256: modifying
     def ethToTokenTransferOutput(tokens_bought: uint256, deadline: timestamp, recipient: address) -> uint256(wei): modifying
 
+WEIGHT_NUMERATOR: constant(uint256) = 4            # Numerator of weight given to new values in moving average calculation
+WEIGHT_DENOMINATOR: constant(uint256) = 5          # Denominator of weight given to new values in moving average calculation
+
 TokenPurchase: event({buyer: indexed(address), eth_sold: indexed(uint256(wei)), tokens_bought: indexed(uint256)})
 EthPurchase: event({buyer: indexed(address), tokens_sold: indexed(uint256), eth_bought: indexed(uint256(wei))})
 AddLiquidity: event({provider: indexed(address), eth_amount: indexed(uint256(wei)), token_amount: indexed(uint256)})
@@ -25,6 +28,8 @@ balances: uint256[address]                        # UNI balance of an address
 allowances: (uint256[address])[address]           # UNI allowance of one address on another
 token: address(ERC20)                             # address of the ERC20 token traded on this contract
 factory: Factory                                  # interface for the factory that created this contract
+latestBlockNum: public(uint256)                   # latest block in which a trade has occurred
+averagePrice: public(uint256)                     # estimated exponential moving average price (of token in ETH)
 
 # @dev This function acts as a contract constructor which is not currently supported in contracts deployed
 #      using create_with_code_of(). It is called once by the factory during contract creation.
@@ -126,6 +131,7 @@ def getOutputPrice(output_amount: uint256, input_reserve: uint256, output_reserv
 @private
 def ethToTokenInput(eth_sold: uint256(wei), min_tokens: uint256, deadline: timestamp, buyer: address, recipient: address) -> uint256:
     assert deadline >= block.timestamp and (eth_sold > 0 and min_tokens > 0)
+    self.updateAveragePrice()
     token_reserve: uint256 = self.token.balanceOf(self)
     tokens_bought: uint256 = self.getInputPrice(as_unitless_number(eth_sold), as_unitless_number(self.balance - eth_sold), token_reserve)
     assert tokens_bought >= min_tokens
@@ -166,6 +172,7 @@ def ethToTokenTransferInput(min_tokens: uint256, deadline: timestamp, recipient:
 @private
 def ethToTokenOutput(tokens_bought: uint256, max_eth: uint256(wei), deadline: timestamp, buyer: address, recipient: address) -> uint256(wei):
     assert deadline >= block.timestamp and (tokens_bought > 0 and max_eth > 0)
+    self.updateAveragePrice()
     token_reserve: uint256 = self.token.balanceOf(self)
     eth_sold: uint256 = self.getOutputPrice(tokens_bought, as_unitless_number(self.balance - max_eth), token_reserve)
     # Throws if eth_sold > max_eth
@@ -175,6 +182,24 @@ def ethToTokenOutput(tokens_bought: uint256, max_eth: uint256(wei), deadline: ti
     assert self.token.transfer(recipient, tokens_bought)
     log.TokenPurchase(buyer, as_wei_value(eth_sold, 'wei'), tokens_bought)
     return as_wei_value(eth_sold, 'wei')
+
+@private
+def updateAveragePrice():
+    if block.number != self.latestBlockNum:
+        distance: uint256 = block.number - self.latestBlockNum
+        adjusted_weight_numerator: uint256 = WEIGHT_NUMERATOR ** distance
+        adjusted_weight_denominator: uint256 = WEIGHT_DENOMINATOR ** distance
+        new_price: uint256 = self.balance / self.token.balanceOf(self) + 1
+        old_price: uint256 = self.averagePrice
+        # TODO: this avoids one overflow problem, see if there's a more elegant way
+        # and figure out how to avoid the other overflow problem
+        if old_price > new_price:
+            self.averagePrice = new_price + 
+                                (old_price - new_price) * adjusted_weight_numerator / adjusted_weight_denominator
+        else:
+            self.averagePrice = new_price -
+                                (new_price - old_price) * adjusted_weight_numerator / adjusted_weight_denominator
+        self.latestBlockNum = block.number
 
 # @notice Convert ETH to Tokens.
 # @dev User specifies maximum input (msg.value) and exact output.
@@ -271,6 +296,7 @@ def tokenToEthTransferOutput(eth_bought: uint256(wei), max_tokens: uint256, dead
 def tokenToTokenInput(tokens_sold: uint256, min_tokens_bought: uint256, min_eth_bought: uint256(wei), deadline: timestamp, buyer: address, recipient: address, exchange_addr: address) -> uint256:
     assert (deadline >= block.timestamp and tokens_sold > 0) and (min_tokens_bought > 0 and min_eth_bought > 0)
     assert exchange_addr != self and exchange_addr != ZERO_ADDRESS
+    self.updateAveragePrice()
     token_reserve: uint256 = self.token.balanceOf(self)
     eth_bought: uint256 = self.getInputPrice(tokens_sold, token_reserve, as_unitless_number(self.balance))
     wei_bought: uint256(wei) = as_wei_value(eth_bought, 'wei')
@@ -312,6 +338,7 @@ def tokenToTokenTransferInput(tokens_sold: uint256, min_tokens_bought: uint256, 
 def tokenToTokenOutput(tokens_bought: uint256, max_tokens_sold: uint256, max_eth_sold: uint256(wei), deadline: timestamp, buyer: address, recipient: address, exchange_addr: address) -> uint256:
     assert deadline >= block.timestamp and (tokens_bought > 0 and max_eth_sold > 0)
     assert exchange_addr != self and exchange_addr != ZERO_ADDRESS
+    self.updateAveragePrice()
     eth_bought: uint256(wei) = Exchange(exchange_addr).getEthToTokenOutputPrice(tokens_bought)
     token_reserve: uint256 = self.token.balanceOf(self)
     tokens_sold: uint256 = self.getOutputPrice(as_unitless_number(eth_bought), token_reserve, as_unitless_number(self.balance))
